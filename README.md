@@ -11,6 +11,8 @@ Your coding agent makes hundreds of tool calls per session. Linters fire, tests 
 
 Then merge hooks.example.json into .claude/settings.json. Done. Every session attests itself on Stop.
 
+macOS and Linux today. Windows: replace ~ with %USERPROFILE% paths in the hook commands, untested.
+
 ## Privacy
 
 Your code stays home. Only the evidence leaves. The hook transmits tool names, timestamps, and hashes. Prompts, file contents, and tool outputs never leave the machine. The local session file in ~/.rubric/sessions/ is the full record; the anchor proves it existed, unmodified, at that time.
