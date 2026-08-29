@@ -14,6 +14,8 @@ const SPOOL = path.join(HOME, "spool");
 const SESSIONS = path.join(HOME, "sessions");
 const CONFIG = path.join(HOME, "config.json");
 const EVIDENCE_KEY = path.join(HOME, "evidence-key.json");
+const PAYLOAD_KEYS = path.join(HOME, "payload-keys.jsonl");
+const ESCROWS = path.join(HOME, "escrows.jsonl");
 const DEFAULT_ENDPOINT = "https://rubric-protocol.com/verify/v1/tiered-attest";
 const DEFAULT_EVIDENCE_ENDPOINT = "https://rubric-protocol.com/v1/evidence";
 
@@ -30,8 +32,8 @@ const cfg = () => {
   try { c = JSON.parse(fs.readFileSync(CONFIG, "utf8")); } catch {}
   return {
     apiKey: process.env.RUBRIC_API_KEY || c.apiKey || "",
-    endpoint: c.endpoint || DEFAULT_ENDPOINT,
-    evidenceEndpoint: c.evidenceEndpoint || DEFAULT_EVIDENCE_ENDPOINT,
+    endpoint: process.env.RUBRIC_ENDPOINT || c.endpoint || DEFAULT_ENDPOINT,
+    evidenceEndpoint: process.env.RUBRIC_EVIDENCE_ENDPOINT || c.evidenceEndpoint || DEFAULT_EVIDENCE_ENDPOINT,
   };
 };
 
@@ -165,10 +167,24 @@ async function flush() {
       if (!j?.attestationId) { console.error("[rubric-attest] attest failed status=" + r.status + "; keeping spool for retry"); continue; }
       fs.mkdirSync(SESSIONS, { recursive: true });
       fs.renameSync(fp, path.join(SESSIONS, f));
+      // payloadKey opens the commitment on the anchored attestation and Rubric
+      // does not retain it. It lives in HOME at 0600, never in the repo-local
+      // .rubric/, which routinely gets committed.
+      if (j.payloadKey) {
+        try {
+          fs.appendFileSync(PAYLOAD_KEYS, JSON.stringify({
+            session, attestationId: j.attestationId,
+            payloadKey: j.payloadKey, payloadCommitment: j.payloadCommitment ?? null,
+            at: new Date().toISOString(),
+          }) + "\n", { mode: 0o600 });
+        } catch (e) { console.error("[rubric-attest] could not store payloadKey: " + (e?.message || e)); }
+      }
       const rec = {
         session, attestationId: j.attestationId,
         verifyUrl: "https://rubric-protocol.com/v1/verify/" + j.attestationId,
-        eventsHash, eventCount: events.length, at: new Date().toISOString(),
+        eventsHash, eventCount: events.length,
+        payloadCommitment: j.payloadCommitment ?? null,
+        at: new Date().toISOString(),
       };
       let out = path.join(process.cwd(), ".rubric");
       try { fs.mkdirSync(out, { recursive: true }); } catch { out = HOME; }
@@ -179,6 +195,117 @@ async function flush() {
     }
   }
   process.exit(0);
+}
+
+// Records written by flush, from the repo-local .rubric first then HOME.
+function attestationRecords() {
+  const out = [];
+  for (const fp of [path.join(process.cwd(), ".rubric", "attestations.jsonl"), path.join(HOME, "attestations.jsonl")]) {
+    try {
+      for (const l of fs.readFileSync(fp, "utf8").split("\n")) {
+        if (l) { try { out.push(JSON.parse(l)); } catch {} }
+      }
+    } catch {}
+  }
+  return out;
+}
+
+function escrowedSessions() {
+  const seen = new Set();
+  try {
+    for (const l of fs.readFileSync(ESCROWS, "utf8").split("\n")) {
+      if (l) { try { seen.add(JSON.parse(l).session); } catch {} }
+    }
+  } catch {}
+  return seen;
+}
+
+async function escrow(years) {
+  const { apiKey, evidenceEndpoint } = cfg();
+  if (!apiKey) { console.error("[rubric-attest] no API key. Run: node attest.mjs init <key>"); process.exit(0); }
+  let key = null;
+  try { key = loadEvidenceKey(); } catch {}
+  if (!key) { console.error("[rubric-attest] no evidence key. Run: node attest.mjs init <key>"); process.exit(0); }
+  const retentionYears = [1, 7, 10].includes(years) ? years : 1;
+
+  const done = escrowedSessions();
+  let sent = 0;
+  for (const rec of attestationRecords()) {
+    if (!rec.session || !rec.attestationId || done.has(rec.session)) continue;
+    const fp = path.join(SESSIONS, rec.session + ".jsonl");
+    if (!fs.existsSync(fp)) continue;
+    done.add(rec.session);
+
+    // The session file is encrypted here, on this machine. What crosses the
+    // wire is ciphertext; the key never leaves.
+    const envelope = seal(key.publicKey, fs.readFileSync(fp));
+    const cipherHash = cipherHashOf(envelope);
+    try {
+      const r = await fetch(evidenceEndpoint + "/" + rec.session, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+        body: JSON.stringify({ envelope, eventsHash: rec.eventsHash, attestationId: rec.attestationId, retentionYears, cipherHash }),
+      });
+      const j = await r.json().catch(() => null);
+      if (r.status === 409) { console.error("[rubric-attest] already escrowed session=" + rec.session); continue; }
+      if (!r.ok) { console.error("[rubric-attest] escrow failed session=" + rec.session + " status=" + r.status + " " + (j?.error ?? "")); continue; }
+      // The server echoes the hash it computed over the stored bytes. If that
+      // disagrees with ours, what it stored is not what we sealed.
+      if (j?.cipherHash !== cipherHash) {
+        console.error("[rubric-attest] CIPHERHASH MISMATCH session=" + rec.session + " sent=" + cipherHash + " echoed=" + (j?.cipherHash ?? "none"));
+        continue;
+      }
+      fs.appendFileSync(ESCROWS, JSON.stringify({
+        session: rec.session, cipherHash, attestationId: rec.attestationId,
+        escrowAttestationId: j.escrowAttestationId ?? null,
+        retentionYears, expiresAt: j.expiresAt ?? null, at: new Date().toISOString(),
+      }) + "\n");
+      sent++;
+      console.error("[rubric-attest] escrowed session=" + rec.session + " retention=" + retentionYears + "y expires=" + (j.expiresAt ?? "?") +
+        (j.escrowAttestationId ? " verify=https://rubric-protocol.com/v1/verify/" + j.escrowAttestationId : " (anchor pending)"));
+    } catch (e) {
+      console.error("[rubric-attest] escrow network error session=" + rec.session + ": " + (e?.message || e));
+    }
+  }
+  if (!sent) console.error("[rubric-attest] nothing new to escrow");
+  process.exit(0);
+}
+
+async function restore(session) {
+  const { apiKey, evidenceEndpoint } = cfg();
+  if (!session) { console.error("usage: attest.mjs restore <sessionId>"); process.exit(1); }
+  let key = null;
+  try { key = loadEvidenceKey(); } catch {}
+  if (!key) { console.error("[rubric-attest] no evidence key; the evidence cannot be opened without it"); process.exit(1); }
+  const r = await fetch(evidenceEndpoint + "/" + session, { headers: { "x-api-key": apiKey } });
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j?.envelope) {
+    console.error("[rubric-attest] restore failed session=" + session + " status=" + r.status + " " + (j?.note ?? j?.error ?? ""));
+    process.exit(1);
+  }
+  // Check the bytes before trusting them: the envelope must rehash to the
+  // cipherHash the escrow anchored.
+  const ch = cipherHashOf(j.envelope);
+  if (j.cipherHash && ch !== j.cipherHash) {
+    console.error("[rubric-attest] CIPHERHASH MISMATCH — stored bytes differ from the anchored hash. Refusing to decrypt.");
+    process.exit(1);
+  }
+  let plain;
+  try { plain = open(key.privateKey, j.envelope); }
+  catch { console.error("[rubric-attest] decryption failed — this evidence was sealed to a different key"); process.exit(1); }
+
+  const dir = path.join(HOME, "restored");
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, session + ".jsonl");
+  fs.writeFileSync(out, plain, { mode: 0o600 });
+
+  const events = plain.toString("utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+  const eventsHash = h(jcs(events));
+  console.error("[rubric-attest] restored session=" + session + " events=" + events.length + " -> " + out);
+  console.error("[rubric-attest] eventsHash(recomputed)=" + eventsHash);
+  console.error("[rubric-attest] eventsHash(escrowed)  =" + (j.eventsHash ?? "?"));
+  console.error("[rubric-attest] " + (eventsHash === j.eventsHash ? "MATCH — the decrypted evidence is the session that was attested." : "MISMATCH"));
+  process.exit(eventsHash === j.eventsHash ? 0 : 1);
 }
 
 function init(key) {
@@ -205,6 +332,8 @@ const mode = process.argv[2];
 if (process.argv[1] && path.basename(process.argv[1]) === "attest.mjs") {
   if (mode === "spool") spool();
   else if (mode === "flush") flush();
+  else if (mode === "escrow") escrow(Number(process.argv[3] ?? 1));
+  else if (mode === "restore") restore(process.argv[3]);
   else if (mode === "init") init(process.argv[3] || "");
-  else console.error("usage: attest.mjs init <apiKey> | spool | flush | escrow");
+  else console.error("usage: attest.mjs init <apiKey> | spool | flush | escrow [years] | restore <sessionId>");
 }
