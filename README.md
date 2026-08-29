@@ -37,3 +37,7 @@ Ed25519 receipts in a JSONL you host prove the chain to whoever trusts your key 
 Free tier covers 1,000 sessions a month. Heavy fleets, batch ingest, and the paid x402 endpoints are at https://rubric-protocol.com.
 
 Built by Rubric Protocol. Post-quantum AI attestation infrastructure on Hedera mainnet.
+
+## See one
+
+A real anchored session from this pack: https://rubric-protocol.com/v1/verify/5194b356-5289-46f5-ac74-48ac7e67db9e (HCS seq 293705). Check it on HashScan without touching Rubric: https://hashscan.io/mainnet/topic/0.0.10416909
