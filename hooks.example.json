@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node ~/.rubric/attest.mjs spool" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "node ~/.rubric/attest.mjs flush" } ] }
+    ]
+  }
+}
