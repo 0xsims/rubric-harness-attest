@@ -24,10 +24,16 @@ The verify URL reports the HCS sequence number. Check it against Hedera directly
 
 The consensus timestamp is Hedera's, not ours. The message payload commits to the aggregate root that includes this attestation.
 
+## 2b. The Merkle path holds
+
+The verify response includes merkle_proof, merkle_proof_directions, and batch_root. Hash the payload, walk the proof in the stated directions, and you must land on batch_root, which the anchored aggregate commits to. Standard RFC 6962 recomputation, any language.
+
 ## 3. The signature is real
 
 Every attestation is ML-DSA-65 signed (FIPS 204). The verify endpoint returns the public key, the signature, and the signed payload; any FIPS 204 implementation checks it offline. Worked example against a live session from this repo:
 
     https://rubric-protocol.com/v1/verify/5194b356-5289-46f5-ac74-48ac7e67db9e
+
+Browser verifier, no install: https://rubric-protocol.com/verify-session.html
 
 Anchored at HCS sequence 293705. Recompute the eventsHash above, check the sequence on the mirror node, verify the signature with any ML-DSA-65 library. If all three hold, the session happened as recorded. Not because we say so.
