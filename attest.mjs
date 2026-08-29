@@ -113,6 +113,20 @@ function ensureEvidenceKey() {
   return rec;
 }
 
+// The exact object submitted to /v1/tiered-attest. escrow rebuilds it from the
+// decrypted session to open the attestation's commitment, so the two callers
+// must produce identical bytes -- hence one definition.
+function sessionData(session, events) {
+  const tools = {};
+  for (const e of events) tools[e.tool] = (tools[e.tool] || 0) + 1;
+  return {
+    spec: "rubric-harness-attest/0.1",
+    session, eventCount: events.length, eventsHash: h(jcs(events)),
+    firstTs: events[0].ts, lastTs: events[events.length - 1].ts, tools,
+    note: "eventsHash commits to the local session file. Only hashes were transmitted.",
+  };
+}
+
 async function readStdin() {
   let s = ""; for await (const c of process.stdin) s += c; return s;
 }
@@ -149,14 +163,7 @@ async function flush() {
     } catch { continue; }
     if (!events.length) { try { fs.unlinkSync(fp); } catch {} continue; }
     const eventsHash = h(jcs(events));
-    const tools = {};
-    for (const e of events) tools[e.tool] = (tools[e.tool] || 0) + 1;
-    const data = {
-      spec: "rubric-harness-attest/0.1",
-      session, eventCount: events.length, eventsHash,
-      firstTs: events[0].ts, lastTs: events[events.length - 1].ts, tools,
-      note: "eventsHash commits to the local session file. Only hashes were transmitted.",
-    };
+    const data = sessionData(session, events);
     try {
       const r = await fetch(endpoint, {
         method: "POST",
@@ -210,6 +217,16 @@ function attestationRecords() {
   return out;
 }
 
+function payloadKeyFor(session) {
+  try {
+    for (const l of fs.readFileSync(PAYLOAD_KEYS, "utf8").split("\n").reverse()) {
+      if (!l) continue;
+      try { const r = JSON.parse(l); if (r.session === session) return r; } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 function escrowedSessions() {
   const seen = new Set();
   try {
@@ -238,15 +255,39 @@ async function escrow(years) {
 
     // The session file is encrypted here, on this machine. What crosses the
     // wire is ciphertext; the key never leaves.
-    const envelope = seal(key.publicKey, fs.readFileSync(fp));
+    // The opening proves this evidence belongs to that attestation. salt is
+    // one-way in payloadKey, so it can be disclosed; the key never is.
+    const pk = payloadKeyFor(rec.session);
+    if (!pk) {
+      console.error("[rubric-attest] no payloadKey for session=" + rec.session + "; cannot bind it to the attestation, skipping");
+      continue;
+    }
+    const raw = fs.readFileSync(fp);
+    const events = raw.toString("utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+    const opening = {
+      salt: crypto.createHash("sha256").update(pk.payloadKey + ":rubric-commit-v1").digest("hex"),
+      data: sessionData(rec.session, events),
+    };
+    const envelope = seal(key.publicKey, raw);
     const cipherHash = cipherHashOf(envelope);
     try {
-      const r = await fetch(evidenceEndpoint + "/" + rec.session, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json", "x-api-key": apiKey },
-        body: JSON.stringify({ envelope, eventsHash: rec.eventsHash, attestationId: rec.attestationId, retentionYears, cipherHash }),
-      });
-      const j = await r.json().catch(() => null);
+      const body = JSON.stringify({ envelope, eventsHash: rec.eventsHash, attestationId: rec.attestationId, retentionYears, cipherHash, opening });
+      let r = null, j = null;
+      // A tiered attestation carries no commitment until the tier-1 flush lands,
+      // so the binding is uncheckable for ~30s after flush. Wait it out rather
+      // than drop the evidence.
+      const deadline = Date.now() + 120_000;
+      for (;;) {
+        r = await fetch(evidenceEndpoint + "/" + rec.session, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+          body,
+        });
+        j = await r.json().catch(() => null);
+        if (r.status !== 503 || !j?.retryable || Date.now() >= deadline) break;
+        console.error("[rubric-attest] waiting for the attestation to flush before binding session=" + rec.session);
+        await new Promise(z => setTimeout(z, Math.min(15_000, j.retryAfterMs ?? 15_000)));
+      }
       if (r.status === 409) { console.error("[rubric-attest] already escrowed session=" + rec.session); continue; }
       if (!r.ok) { console.error("[rubric-attest] escrow failed session=" + rec.session + " status=" + r.status + " " + (j?.error ?? "")); continue; }
       // The server echoes the hash it computed over the stored bytes. If that
