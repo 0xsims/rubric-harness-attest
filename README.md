@@ -30,7 +30,7 @@ Anchoring proves a record is authentic if you still have the record. Escrow make
     node attest.mjs escrow 7        # seal every attested session, 7-year retention
     node attest.mjs restore <id>    # get it back, from any machine, forever
 
-The session is encrypted on your machine with your evidence key. Rubric stores ciphertext it cannot read, bound to the anchor. Recovery needs exactly one file: evidence-key.json. Not an API key, not an account, not our cooperation. Restore proves you hold the key by decrypting a challenge sealed to it, then returns the envelope, decrypts locally, and checks the result against the anchored hash before calling it a match.
+The session is encrypted on your machine with your evidence key. Rubric stores ciphertext it cannot read, bound to the anchor. Recovery needs exactly one file: evidence-key.json. Not an API key, not an account, not our cooperation. Restore proves you hold the key by decrypting a challenge sealed to it, then fetches the envelope, decrypts locally, and checks the result against the anchored hash before calling it a match.
 
 Two modes, choose deliberately:
 
