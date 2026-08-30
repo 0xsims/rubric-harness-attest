@@ -93,8 +93,22 @@ export function open(userPrivRaw, env) {
 
 export const cipherHashOf = env => h(jcs(env));
 
+// A survival kit is one file. Recovery must work from a directory holding only
+// evidence-key.json and this client, with no config and no API key -- so the key
+// is looked for beside the caller as well as in the usual place.
+function evidenceKeyPath() {
+  const candidates = [
+    process.env.RUBRIC_EVIDENCE_KEY,
+    EVIDENCE_KEY,
+    path.join(process.cwd(), "evidence-key.json"),
+    path.join(process.cwd(), ".rubric", "evidence-key.json"),
+  ].filter(Boolean);
+  for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch {} }
+  return EVIDENCE_KEY;
+}
+
 export function loadEvidenceKey() {
-  const k = JSON.parse(fs.readFileSync(EVIDENCE_KEY, "utf8"));
+  const k = JSON.parse(fs.readFileSync(evidenceKeyPath(), "utf8"));
   return { publicKey: Buffer.from(k.publicKey, "base64"), privateKey: Buffer.from(k.privateKey, "base64") };
 }
 
@@ -283,7 +297,9 @@ async function escrow(years) {
     const envelope = seal(key.publicKey, raw);
     const cipherHash = cipherHashOf(envelope);
     try {
-      const body = JSON.stringify({ envelope, eventsHash: rec.eventsHash, attestationId: rec.attestationId, retentionYears, cipherHash, opening });
+      // Declares which key can later prove possession. Public half only.
+      const body = JSON.stringify({ envelope, eventsHash: rec.eventsHash, attestationId: rec.attestationId, retentionYears, cipherHash, opening,
+        recipientPublicKey: key.publicKey.toString("hex") });
       let r = null, j = null;
       // A tiered attestation carries no commitment until the tier-1 flush lands,
       // so the binding is uncheckable for ~30s after flush. Wait it out rather
@@ -329,13 +345,49 @@ async function restore(session) {
   if (!session) { console.error("usage: attest.mjs restore <sessionId>"); process.exit(1); }
   let key = null;
   try { key = loadEvidenceKey(); } catch {}
+  // The evidence key is the only hard requirement. No init, no config, no API
+  // key: those are needed to store evidence, not to recover it.
   if (!key) { console.error("[rubric-attest] no evidence key; the evidence cannot be opened without it"); process.exit(1); }
-  const r = await fetch(evidenceEndpoint + "/" + session, { headers: { "x-api-key": apiKey } });
-  const j = await r.json().catch(() => null);
+  // Challenge first: proving possession of the evidence key needs no API key,
+  // which is the point -- keys rotate and lapse, the evidence key must not.
+  // Falls back to the API key only when the record predates this (409 legacy).
+  let r = null, j = null, via = "";
+  try {
+    const ch = await fetch(evidenceEndpoint + "/" + session + "/challenge", { method: "POST" });
+    const cj = await ch.json().catch(() => null);
+    if (ch.status === 409 && cj?.legacy) {
+      console.error("[rubric-attest] legacy record (no recipient key); falling back to the API key");
+    } else if (ch.ok && cj?.challenge && cj?.nonceId) {
+      let nonce = null;
+      try { nonce = open(key.privateKey, cj.challenge).toString("utf8"); }
+      catch { console.error("[rubric-attest] challenge did not open with this evidence key"); }
+      if (nonce) {
+        r = await fetch(evidenceEndpoint + "/" + session, { headers: { "x-evidence-proof": cj.nonceId + ":" + nonce } });
+        j = await r.json().catch(() => null);
+        if (r.ok && j?.envelope) via = "possession proof";
+        else { console.error("[rubric-attest] proof rejected status=" + r.status); r = null; j = null; }
+      }
+    } else if (!ch.ok) {
+      console.error("[rubric-attest] challenge unavailable status=" + ch.status + "; falling back to the API key");
+    }
+  } catch (e) {
+    console.error("[rubric-attest] challenge error: " + (e?.message || e) + "; falling back to the API key");
+  }
+
+  if (!j?.envelope) {
+    if (!apiKey) {
+      console.error("[rubric-attest] no possession proof accepted and no API key configured; cannot restore session=" + session);
+      process.exit(1);
+    }
+    r = await fetch(evidenceEndpoint + "/" + session, { headers: { "x-api-key": apiKey } });
+    j = await r.json().catch(() => null);
+    via = "api key";
+  }
   if (!r.ok || !j?.envelope) {
     console.error("[rubric-attest] restore failed session=" + session + " status=" + r.status + " " + (j?.note ?? j?.error ?? ""));
     process.exit(1);
   }
+  console.error("[rubric-attest] authorized via " + via);
   // Check the bytes before trusting them: the envelope must rehash to the
   // cipherHash the escrow anchored.
   const ch = cipherHashOf(j.envelope);
