@@ -23,6 +23,23 @@ Your code stays home. Only the evidence leaves. The hook transmits tool names, t
 - A public verify URL per session backed by Hedera consensus
 - Independent verification: HashScan, Mirror Node, or the standalone verifier scripts. No account needed to check.
 
+## Escrow: evidence that survives your laptop
+
+Anchoring proves a record is authentic if you still have the record. Escrow makes sure you still have it.
+
+    node attest.mjs escrow 7        # seal every attested session, 7-year retention
+    node attest.mjs restore <id>    # get it back, from any machine, forever
+
+The session is encrypted on your machine with your evidence key. Rubric stores ciphertext it cannot read, bound to the anchor. Recovery needs exactly one file: evidence-key.json. Not an API key, not an account, not our cooperation. Restore proves you hold the key by decrypting a challenge sealed to it, then returns the envelope, decrypts locally, and checks the result against the anchored hash before calling it a match.
+
+Two modes, choose deliberately:
+
+Hash-only (default): the spool keeps fingerprints. Escrow retains proof that a specific session existed, unaltered, in a specific order. It cannot bring content back. Right for teams whose plaintext must never persist anywhere.
+
+Content mode (init with --retain-content): tool inputs and outputs are kept locally and sealed into escrow. Restore returns the actual commands and outputs, hash-verified. Right for anyone escrowing because recovery is the point.
+
+At retention expiry the ciphertext is destroyed and the destruction itself is attested. Retention and erasure, both provable. See DEMO.md for the full run, including the failure we shipped and fixed.
+
 ## Why not just signed local receipts
 
 Ed25519 receipts in a JSONL you host prove the chain to whoever trusts your key and your disk. An anchored attestation proves it to people who trust neither. The proof outlives the operator, the laptop, and eventually the signature algorithm. That is the difference between a log and evidence.
