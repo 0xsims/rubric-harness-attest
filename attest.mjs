@@ -34,6 +34,7 @@ const cfg = () => {
     apiKey: process.env.RUBRIC_API_KEY || c.apiKey || "",
     endpoint: process.env.RUBRIC_ENDPOINT || c.endpoint || DEFAULT_ENDPOINT,
     evidenceEndpoint: process.env.RUBRIC_EVIDENCE_ENDPOINT || c.evidenceEndpoint || DEFAULT_EVIDENCE_ENDPOINT,
+    retainContent: !!c.retainContent,
   };
 };
 
@@ -143,6 +144,17 @@ async function spool() {
       resultHash: h(jcs(j.tool_response ?? null)),
       cwdHash: h(String(j.cwd || process.cwd())),
     };
+    // Content mode: keep the letter, not just the seal. Off by default; some
+    // users want plaintext to never persist anywhere. When on, escrow retains
+    // recoverable evidence rather than a manifest of fingerprints. Per-field
+    // cap keeps one giant tool output from blowing the 2MB envelope.
+    try {
+      if (cfg().retainContent) {
+        const cap = (v) => { const t = jcs(v ?? null); return t.length > 65536 ? { truncated: true, bytes: t.length, head: t.slice(0, 65536) } : (v ?? null); };
+        ev.args = cap(j.tool_input);
+        ev.result = cap(j.tool_response);
+      }
+    } catch (e) { console.error("[rubric-attest] content retention failed (hashes still committed): " + (e?.message || e)); }
     fs.mkdirSync(SPOOL, { recursive: true });
     fs.appendFileSync(path.join(SPOOL, session + ".jsonl"), JSON.stringify(ev) + "\n");
   } catch { /* evidence is best-effort; the agent always comes first */ }
@@ -349,9 +361,10 @@ async function restore(session) {
   process.exit(eventsHash === j.eventsHash ? 0 : 1);
 }
 
-function init(key) {
+function init(key, retainContent) {
   fs.mkdirSync(HOME, { recursive: true });
-  fs.writeFileSync(CONFIG, JSON.stringify({ apiKey: key, endpoint: DEFAULT_ENDPOINT, evidenceEndpoint: DEFAULT_EVIDENCE_ENDPOINT }, null, 2), { mode: 0o600 });
+  fs.writeFileSync(CONFIG, JSON.stringify({ apiKey: key, endpoint: DEFAULT_ENDPOINT, evidenceEndpoint: DEFAULT_EVIDENCE_ENDPOINT, retainContent: !!retainContent }, null, 2), { mode: 0o600 });
+  if (retainContent) console.error("[rubric-attest] content retention ON: tool inputs and outputs are stored locally and included in escrow. Hash-only mode is the default; this was your explicit choice.");
   const existed = fs.existsSync(EVIDENCE_KEY);
   const k = ensureEvidenceKey();
   console.error("[rubric-attest] configured. Free tier: 1,000 sessions/month.");
@@ -375,6 +388,6 @@ if (process.argv[1] && path.basename(process.argv[1]) === "attest.mjs") {
   else if (mode === "flush") flush();
   else if (mode === "escrow") escrow(Number(process.argv[3] ?? 1));
   else if (mode === "restore") restore(process.argv[3]);
-  else if (mode === "init") init(process.argv[3] || "");
-  else console.error("usage: attest.mjs init <apiKey> | spool | flush | escrow [years] | restore <sessionId>");
+  else if (mode === "init") init(process.argv[3] || "", process.argv.includes("--retain-content"));
+  else console.error("usage: attest.mjs init <apiKey> [--retain-content] | spool | flush | escrow [years] | restore <sessionId>");
 }
